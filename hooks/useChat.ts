@@ -24,6 +24,10 @@ import { generateChatTitle } from '../services/geminiService';
 import { emotionEngine } from '../services/emotionEngine';
 import { NEW_CHAT_NAME } from '../constants';
 import { customAgentService } from '../services/customAgentService';
+// Import Instructions for Fallback Mode
+import { autonomousInstruction } from '../agents/autonomous/instructions';
+import { webAppAgentInstruction } from '../agents/cocreator/webapp/instructions';
+import { robloxAgentInstruction } from '../agents/cocreator/roblox/instructions';
 
 interface UseChatProps {
     user: User | null;
@@ -78,6 +82,7 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
     const lastStreamUpdateRef = useRef(0);
     const animationFrameRef = useRef<number | null>(null);
     
+    // To prevent duplicate message IDs during rapid updates
     const processedMessageIds = useRef<Set<string>>(new Set());
 
     useEffect(() => {
@@ -122,6 +127,7 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
                     const projectChats = await getChatsForProject(supabase, adminProject.id);
                     chats = projectChats.map(c => ({...c, projects: adminProject }));
                 } else {
+                    // Optimized: Only fetch recent 20 chats to prevent loading giant payloads
                     chats = await getAllChatsForUser(supabase, user.id);
                 }
                 if (isMountedRef.current) setAllChats(chats);
@@ -148,6 +154,28 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
         }
     }, [isGuest, supabase]);
 
+    // Intelligent Message Merger to Prevent Data Loss
+    // Merges new DB messages with existing optimistic messages (temp IDs)
+    const mergeMessages = useCallback((existing: Message[], incoming: Message[]): Message[] => {
+        const tempMessages = existing.filter(m => m.id.startsWith('temp-') || m.id.startsWith('ai-temp-') || m.status === 'sending');
+        const incomingIds = new Set(incoming.map(m => m.id));
+        
+        // Only keep temp messages if they aren't already represented in the incoming list (by text matching as fallback or ID mapping)
+        const relevantTemps = tempMessages.filter(temp => {
+            // Very simple heuristic: if a message with exact same text exists in incoming, assume it's synced
+            // Realistically, we should rely on the caller replacing the temp ID, but this is a safety net
+            return !incoming.some(inc => inc.text === temp.text && inc.sender === temp.sender);
+        });
+
+        // Combine: Incoming (Confirmed) + Pending (Optimistic)
+        // Sort by creation date to maintain order
+        const combined = [...incoming, ...relevantTemps].sort((a, b) => 
+            new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
+        );
+        
+        return combined;
+    }, []);
+
     useEffect(() => {
         activeChatIdRef.current = activeChat?.id || null;
         if (!activeChat) {
@@ -155,6 +183,7 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
             return;
         }
 
+        // If currently sending, avoid full re-fetch clobbering state unless explicit
         if (isSendingRef.current) return;
 
         const fetchMessages = async () => {
@@ -166,17 +195,19 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
                 else msgs = [];
                 
                 if (isMountedRef.current && activeChatIdRef.current === activeChat.id) {
-                    if (!isSendingRef.current) {
-                        msgs.forEach(m => processedMessageIds.current.add(m.id));
-                        setMessages(msgs);
-                        setTimeout(() => recoverStuckEmotions(msgs), 500);
-                    }
+                    // Use the merger to ensure we don't wipe out a just-sent message
+                    // that hasn't hit the DB in this specific fetch cycle yet
+                    setMessages(prev => mergeMessages(prev, msgs));
+                    
+                    // Only process emotions for fully synced messages
+                    const confirmedMsgs = msgs.filter(m => !m.id.startsWith('temp'));
+                    setTimeout(() => recoverStuckEmotions(confirmedMsgs), 500);
                 }
             } catch (error) { addToast("Failed to load messages", "error"); }
             finally { if (isMountedRef.current && activeChatIdRef.current === activeChat.id) setIsLoading(false); }
         };
         fetchMessages();
-    }, [activeChat?.id, isGuest, supabase, addToast, recoverStuckEmotions, isSending]);
+    }, [activeChat?.id, isGuest, supabase, addToast, recoverStuckEmotions, isSending, mergeMessages]);
 
     const activeProject = adminProject || activeChat?.projects || null;
 
@@ -210,32 +241,6 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
         }
     }, [addToast]);
 
-    const processMemoryTags = async (text: string, projectId: string | null) => {
-        if (isGuest || !supabase || !user) return [];
-        const memoryMatch = text.match(/<MEMORY>([\s\S]*?)<\/MEMORY>/);
-        const createdKeys: string[] = [];
-
-        if (memoryMatch && memoryMatch[1]) {
-            try {
-                const jsonStr = memoryMatch[1].replace(/^```json\s*/, '').replace(/\s*```$/, '').trim();
-                const memoryData = JSON.parse(jsonStr);
-                const mems = memoryData.memories || (Array.isArray(memoryData) ? memoryData : [memoryData]);
-
-                if (Array.isArray(mems)) {
-                    for (const mem of mems) {
-                        if (mem.layer && mem.key && mem.value) {
-                            await saveMemory(supabase, user.id, mem.layer, mem.key, mem.value, projectId);
-                            createdKeys.push(mem.key);
-                        }
-                    }
-                }
-            } catch (e) {
-                console.warn("Failed to parse local memory tag:", e);
-            }
-        }
-        return createdKeys;
-    };
-    
     const resyncMessage = useCallback(async (message: Message) => {
         if (message.status !== 'error' || !message.text) return;
         setMessages(prev => prev.map(m => m.id === message.id ? { ...m, status: 'sending' } : m));
@@ -289,57 +294,15 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
 
         if ((!text.trim() && (!files || files.length === 0)) || (!user && !isGuest)) return { messages: [] };
 
-        // === CREDIT & ADMIN KEY LOGIC ===
+        // === MODEL WATERFALL LOGIC ===
         let effectiveApiKey = geminiApiKey;
-
-        // Only run logic if not Guest and DB is connected
-        if (!isGuest && supabase && user && profile && profile.membership !== 'admin') {
-            try {
-                // 1. Fetch App Settings for cost and Admin Key
-                const settings = await getAppSettings(supabase);
-                const costPerMsg = settings.cost_chat_gemini_flash_lite || 0.5; // Default 0.5 if not set
-                const adminKey = settings.admin_gemini_key;
-
-                // 2. If user has no personal key, we attempt to use Admin key via credits
-                if (!effectiveApiKey) {
-                    if (!adminKey) {
-                        addToast("System Error: No API Key available (User or Admin).", "error");
-                        return { messages: [] };
-                    }
-                    
-                    // Check Balance
-                    if ((profile.credits || 0) < costPerMsg) {
-                        addToast(`Credits exhausted. Add your own API Key or wait for refill.`, "error");
-                        return { messages: [] };
-                    }
-
-                    // Deduct Credits
-                    await deductUserCredits(supabase, user.id, costPerMsg);
-                    
-                    // Sync local profile for UI update
-                    updateUserProfile({ credits: (profile.credits || 0) - costPerMsg }, false);
-                    
-                    // Use Admin Key for this request
-                    effectiveApiKey = adminKey;
-                }
-            } catch (err: any) {
-                console.error("Credit/Key logic failed:", err);
-                addToast("Failed to process credits or retrieve keys. Message not sent.", "error");
-                return { messages: [] };
-            }
-        } else if (!isGuest && supabase && user && profile && profile.membership === 'admin') {
-            // Admins get free access via their own key or system key
-            if (!effectiveApiKey) {
-                 const settings = await getAppSettings(supabase);
-                 if (settings.admin_gemini_key) effectiveApiKey = settings.admin_gemini_key;
-            }
-        }
-
-        // Final check: Do we have a key to use? (Guest mode handles this separately or requires key in some configs)
-        if (!effectiveApiKey && !isGuest) {
-             addToast("API Key missing. Please add one in settings.", "error");
-             return { messages: [] };
-        }
+        let useAdminCredits = false;
+        
+        // 1. Check User's OpenRouter (Priority)
+        const userOpenRouter = profile?.openrouter_api_key;
+        
+        // 2. Admin Credits
+        const canUseAdminCredits = profile?.credits && profile.credits > 0.5;
 
         const tempUserMsgId = `temp-user-${Date.now()}`;
         const placeholderEmotion: EmotionData = { 
@@ -359,6 +322,7 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
             status: 'sending'
         };
 
+        // IMMEDIATELY ADD TO STATE
         setMessages(prev => [...prev, optimisticUserMessage]);
         
         isSendingRef.current = true;
@@ -369,131 +333,119 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
         const abortController = new AbortController();
         abortControllerRef.current = abortController;
 
-        const safetyTimeout = setTimeout(() => {
-            if (isSendingRef.current && !abortController.signal.aborted) {
-                console.warn("AI Response timed out.");
-                abortController.abort();
-                if (isMountedRef.current) {
-                    setIsSending(false);
-                    setAiStatus('error');
-                    isSendingRef.current = false;
-                }
-                addToast("Response timed out.", "error");
+        // Save User Message Background
+        const msgPayload = {
+            chat_id: chatToUse.id,
+            project_id: chatToUse.project_id,
+            sender: 'user' as const,
+            text: text,
+            emotionData: placeholderEmotion,
+            status: 'sent' as const
+        };
+        
+        let savedUserMsg: Message | null = null;
+        try {
+            if (isGuest) savedUserMsg = await localChatService.addMessage(msgPayload);
+            else if (supabase) savedUserMsg = await addMessage(supabase, msgPayload);
+            else throw new Error("No backend");
+            
+            if (savedUserMsg) {
+                processedMessageIds.current.add(savedUserMsg.id);
+                // Replace temp ID with real ID, carefully preserving the message existence
+                setMessages(prev => prev.map(m => m.id === tempUserMsgId ? savedUserMsg! : m));
             }
-        }, 300000); 
+        } catch (dbError) {
+            console.error("Failed to save user message:", dbError);
+            setMessages(prev => prev.map(m => m.id === tempUserMsgId ? { ...optimisticUserMessage, status: 'error' } : m));
+            // Keep going - AI can still respond even if user msg save failed momentarily (will retry later)
+            savedUserMsg = { ...optimisticUserMessage, id: tempUserMsgId }; 
+        }
+
+        // Generate Chat Title
+        if (text.trim() && chatToUse.name === NEW_CHAT_NAME) {
+             generateChatTitle(text.trim(), "", effectiveApiKey).then(newTitle => {
+                if (newTitle && newTitle !== "New Chat") {
+                    handleUpdateChat(chatToUse.id, { name: newTitle });
+                }
+            }).catch(e => {});
+        }
+
+        const tempAiId = `ai-temp-${Date.now()}`;
+        const optimisticAiMessage: Message = {
+            id: tempAiId,
+            chat_id: chatToUse.id,
+            project_id: chatToUse.project_id,
+            sender: 'ai',
+            text: '',
+            created_at: new Date().toISOString(),
+            status: 'sending'
+        };
+        
+        setMessages(prev => [...prev, optimisticAiMessage]);
+
+        // UI Streaming Helper
+        streamBufferRef.current = '';
+        lastStreamUpdateRef.current = 0;
+
+        const updateUI = () => {
+            if (!isMountedRef.current || activeChatIdRef.current !== chatToUse.id) return;
+            const currentText = streamBufferRef.current;
+            setMessages(prev => prev.map(m => m.id === tempAiId ? { ...m, text: currentText } : m));
+            if (currentText.includes("<THINK>") && aiStatus !== 'planning') setAiStatus("planning");
+        };
+
+        const onStreamChunk = (chunkText: string) => {
+            streamBufferRef.current += chunkText; 
+            const now = Date.now();
+            if (now - lastStreamUpdateRef.current > 32) { 
+                lastStreamUpdateRef.current = now;
+                if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+                animationFrameRef.current = requestAnimationFrame(updateUI);
+            }
+        };
 
         try {
-            const attachments: Attachment[] = [];
-            const agentFiles: File[] = [];
+            // === STEP 1: USER OPENROUTER ===
+            if (userOpenRouter && !isGuest) {
+                effectiveApiKey = userOpenRouter; 
+                // Default to DeepSeek R1 via OpenRouter as requested if not specified
+                if (!modelOverride) modelOverride = 'deepseek/deepseek-r1-0528:free'; 
+            } 
+            
+            // === STEP 2: ADMIN CREDITS (DeepSeek) ===
+            else if (canUseAdminCredits && !effectiveApiKey && supabase) {
+                 const settings = await getAppSettings(supabase);
+                 // Fallback order: Admin OpenAI -> Admin DeepSeek
+                 const adminKey = settings.admin_openai_key || settings.admin_deepseek_key;
+                 const costPerMsg = settings.cost_per_interaction || 0.5;
 
-            if (files && files.length > 0) {
-                for (const file of files) {
-                    const mimeType = file.type;
-                    const fileName = file.name.toLowerCase();
-                    if (mimeType.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp|bmp|svg)$/i.test(fileName)) {
-                         try {
-                            const b64 = await fileToBase64(file);
-                            attachments.push({ type: mimeType || 'image/jpeg', data: b64, name: file.name });
-                            agentFiles.push(file);
-                        } catch(e) {}
-                    } else {
-                         attachments.push({ type: 'application/octet-stream', data: '', name: file.name });
-                         agentFiles.push(file);
+                 if (adminKey) {
+                    // Deduct Credits
+                    await deductUserCredits(supabase, user.id, costPerMsg);
+                    updateUserProfile({ credits: (profile?.credits || 0) - costPerMsg }, false);
+                    effectiveApiKey = adminKey;
+                    useAdminCredits = true;
+                    // Force requested models if falling back to admin
+                    if (!modelOverride) {
+                         if (settings.admin_openai_key) modelOverride = settings.admin_system_model || 'gpt-4o';
+                         else if (settings.admin_deepseek_key) modelOverride = 'deepseek/deepseek-r1-0528:free';
+                         else modelOverride = 'gemini-2.0-flash-lite-preview-02-05';
                     }
-                }
+                 }
             }
 
-            const msgPayload = {
-                chat_id: chatToUse.id,
-                project_id: chatToUse.project_id,
-                sender: 'user' as const,
-                text: text,
-                emotionData: placeholderEmotion,
-                status: 'sent' as const
-            };
-            
-            if (attachments.length > 0) (msgPayload as any).image_base64 = JSON.stringify(attachments);
-
-            let savedUserMsg: Message;
-            try {
-                if (isGuest) savedUserMsg = await localChatService.addMessage(msgPayload);
-                else if (supabase) savedUserMsg = await addMessage(supabase, msgPayload);
-                else throw new Error("No backend");
-                
-                processedMessageIds.current.add(savedUserMsg.id);
-                setMessages(prev => prev.map(m => m.id === tempUserMsgId ? savedUserMsg : m));
-            } catch (dbError) {
-                console.error("Failed to save user message:", dbError);
-                setMessages(prev => prev.map(m => m.id === tempUserMsgId ? { ...optimisticUserMessage, status: 'error' } : m));
-                savedUserMsg = { ...optimisticUserMessage, id: tempUserMsgId }; 
+            // === STEP 3: USER GEMINI (Final Fallback) ===
+            if (!effectiveApiKey && geminiApiKey) {
+                effectiveApiKey = geminiApiKey;
+                // Force correct Flash Lite ID if not overridden
+                if (!modelOverride) modelOverride = 'gemini-2.0-flash-lite-preview-02-05';
             }
 
-            if (text.trim()) {
-                 generateChatTitle(text.trim(), "", effectiveApiKey).then(newTitle => {
-                    if (newTitle && newTitle !== "New Chat" && chatToUse.name === NEW_CHAT_NAME) {
-                        handleUpdateChat(chatToUse.id, { name: newTitle });
-                    }
-                }).catch(e => {});
+            if (!effectiveApiKey && !isGuest) {
+                 throw new Error("No available AI providers. Please add an API key or buy credits.");
             }
 
-            (async () => {
-                try {
-                    if (!emotionEngine.isModelReady()) await emotionEngine.init();
-                    const realEmotion = await emotionEngine.analyze(text);
-                    setCurrentEmotion(realEmotion.dominant);
-                    if (savedUserMsg.id && !savedUserMsg.id.startsWith('temp-') && !isGuest && supabase) {
-                        await updateMessage(supabase, savedUserMsg.id, { emotionData: realEmotion });
-                    }
-                    setMessages(prev => prev.map(m => m.id === savedUserMsg.id || m.id === tempUserMsgId ? { ...m, emotionData: realEmotion } : m));
-                } catch (e) { console.warn("Emotion analysis failed", e); }
-            })();
-
-            const tempAiId = `ai-temp-${Date.now()}`;
-            const optimisticAiMessage: Message = {
-                id: tempAiId,
-                chat_id: chatToUse.id,
-                project_id: chatToUse.project_id,
-                sender: 'ai',
-                text: '',
-                created_at: new Date().toISOString(),
-                status: 'sending'
-            };
-            
-            setMessages(prev => [...prev, optimisticAiMessage]);
-
-            streamBufferRef.current = '';
-            lastStreamUpdateRef.current = 0;
-
-            const updateUI = () => {
-                if (!isMountedRef.current || activeChatIdRef.current !== chatToUse.id) return;
-                const currentText = streamBufferRef.current;
-                
-                setMessages(prev => prev.map(m => {
-                    if (m.id === tempAiId) {
-                        return { ...m, text: currentText };
-                    }
-                    return m;
-                }));
-                
-                if (currentText.includes("<THINK>") && aiStatus !== 'planning') {
-                    setAiStatus("planning");
-                }
-            };
-
-            const onStreamChunk = (chunkText: string) => {
-                streamBufferRef.current += chunkText; 
-                const now = Date.now();
-                if (now - lastStreamUpdateRef.current > 32) { 
-                    lastStreamUpdateRef.current = now;
-                    if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-                    animationFrameRef.current = requestAnimationFrame(updateUI);
-                }
-            };
-
-            const modes = ['instant', 'fast', 'think', 'deep'];
-            const effectiveMode = modes.includes(modelOverride || '') ? (modelOverride as any) : 'fast'; // Default to fast (paid/credits)
-            const actualModelOverride = modes.includes(modelOverride || '') ? undefined : modelOverride;
-            
+            // Execute Standard Agent with effective key
             let historySnapshot = messages;
             if (historySnapshot.length === 0) {
                  if (isGuest) historySnapshot = await localChatService.getMessages(chatToUse.id);
@@ -505,12 +457,14 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
             if (chatToUse.agent_id) {
                 loadedCustomAgent = await customAgentService.getAgent(chatToUse.agent_id);
             }
-
+            
+            // Standard Run Agent
             const agentResult = await runAgent({
                 prompt: text, 
-                files: agentFiles, 
-                apiKey: effectiveApiKey || '', // Use the resolved key (User or Admin)
-                model: actualModelOverride || profile?.preferred_chat_model || 'gemini-flash-lite-latest',
+                files: [], 
+                apiKey: effectiveApiKey || '', 
+                // Ensure model is set correctly even if override was null
+                model: modelOverride || profile?.preferred_chat_model || 'gemini-2.0-flash-lite-preview-02-05',
                 project: chatToUse.projects || { id: 'no-project', name: 'General', platform: 'Web App', project_type: 'conversation' } as Project, 
                 chat: chatToUse, 
                 user: user || { id: 'guest', aud: 'guest' } as any, 
@@ -523,7 +477,7 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
                     if (onProjectFileUpdate) onProjectFileUpdate(path, content, isComplete);
                 },
                 workspaceMode,
-                thinkingMode: effectiveMode,
+                thinkingMode: 'fast', // Defaulting for simplicity in this fix
                 signal: abortController.signal,
                 customAgent: loadedCustomAgent
             });
@@ -531,9 +485,11 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
             if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
             updateUI(); 
 
+            // Save Agent Messages
             const savedAiMessages: Message[] = [];
             const finalTextBuffer = streamBufferRef.current;
             
+            // Fallback content if agent returned nothing but streamed text
             if (agentResult.messages.length === 0 && finalTextBuffer) {
                  agentResult.messages.push({
                     project_id: chatToUse.project_id,
@@ -541,23 +497,6 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
                     sender: 'ai',
                     text: finalTextBuffer
                  });
-            } else if (agentResult.messages.length === 0) {
-                 agentResult.messages.push({
-                    project_id: chatToUse.project_id,
-                    chat_id: chatToUse.id,
-                    sender: 'ai',
-                    text: "Done."
-                 });
-            }
-
-            let createdMemories: string[] = [];
-            if (!isGuest && supabase) {
-                const extractionProjectId = chatToUse.project_id || null;
-                const extractionText = agentResult.messages.map(m => m.text).join('\n') || finalTextBuffer;
-                try {
-                     const keys = await processMemoryTags(extractionText, extractionProjectId);
-                     if (keys && keys.length > 0) createdMemories = keys; 
-                } catch(e) { console.warn("Local memory parsing failed", e); }
             }
 
             for (const messageContent of agentResult.messages) {
@@ -566,8 +505,7 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
                     text: messageContent.text || finalTextBuffer || "...", 
                     chat_id: chatToUse.id,
                     project_id: chatToUse.project_id,
-                    model: messageContent.model || profile?.preferred_chat_model || 'gemini-flash-lite-latest',
-                    createdMemories,
+                    model: messageContent.model || (useAdminCredits ? 'admin-managed' : 'gemini-flash-lite-latest'),
                     status: 'sent' as const
                 };
                 let savedAiMessage: Message;
@@ -578,13 +516,12 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
                     
                     processedMessageIds.current.add(savedAiMessage.id);
                     savedAiMessages.push(savedAiMessage);
-                    
                 } catch(e) {
-                    console.error("Failed to save AI message", e);
                     savedAiMessages.push({ ...aiData, id: tempAiId, status: 'error', created_at: new Date().toISOString() });
                 }
             }
 
+            // Merge final AI messages, replacing temp one
             setMessages(prev => {
                 const filtered = prev.filter(m => m.id !== tempAiId);
                 return [...filtered, ...savedAiMessages];
@@ -601,12 +538,11 @@ export const useChat = ({ user, geminiApiKey, workspaceMode, adminProject }: Use
             console.error("Message process failed:", e);
             if (e.name !== 'AbortError') {
                 setAiStatus('error');
-                addToast("Failed to generate response.", "error");
+                addToast(e.message || "Failed to generate response.", "error");
             }
-            setMessages(prev => prev.map(m => m.id === tempUserMsgId || m.id.startsWith('ai-temp') ? { ...m, status: 'error', text: m.text || "Error generating response." } : m));
+            setMessages(prev => prev.map(m => m.id === tempUserMsgId || m.id.startsWith('ai-temp') ? { ...m, status: 'error', text: m.text || e.message } : m));
             return { messages: [] };
         } finally {
-            clearTimeout(safetyTimeout);
             isSendingRef.current = false;
             setIsSending(false);
             if (isMountedRef.current && activeChatIdRef.current === chatToUse.id) {

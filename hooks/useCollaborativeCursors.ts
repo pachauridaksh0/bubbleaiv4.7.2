@@ -17,6 +17,14 @@ export const useCollaborativeCursors = (projectId: string) => {
     const [cursors, setCursors] = useState<Record<string, CursorPosition>>({});
     const myColor = useRef(COLORS[Math.floor(Math.random() * COLORS.length)]);
     const containerRef = useRef<HTMLDivElement>(null);
+    
+    // Use refs for stable access inside effect/callbacks without triggering re-runs
+    const profileRef = useRef(profile);
+    
+    // Update ref when profile changes, but don't re-trigger the main effect
+    useEffect(() => {
+        profileRef.current = profile;
+    }, [profile]);
 
     useEffect(() => {
         if (!user || !supabase || !projectId) return;
@@ -53,7 +61,7 @@ export const useCollaborativeCursors = (projectId: string) => {
                 if (status === 'SUBSCRIBED') {
                     // Initial track
                     await channel.track({
-                        user: profile?.roblox_username || 'Anonymous',
+                        user: profileRef.current?.roblox_username || 'Anonymous',
                         color: myColor.current,
                         x: 0,
                         y: 0,
@@ -61,7 +69,14 @@ export const useCollaborativeCursors = (projectId: string) => {
                 }
             });
 
+        // Throttling logic
+        let lastUpdate = 0;
+        const THROTTLE_MS = 100; // 10 updates per second max
+
         const handleMouseMove = (e: MouseEvent) => {
+            const now = Date.now();
+            if (now - lastUpdate < THROTTLE_MS) return;
+            
             if (!containerRef.current) return;
             
             const rect = containerRef.current.getBoundingClientRect();
@@ -70,8 +85,9 @@ export const useCollaborativeCursors = (projectId: string) => {
             const y = ((e.clientY - rect.top) / rect.height) * 100;
 
             if (x >= 0 && x <= 100 && y >= 0 && y <= 100) {
+                lastUpdate = now;
                 channel.track({
-                    user: profile?.roblox_username || 'Anonymous',
+                    user: profileRef.current?.roblox_username || 'Anonymous',
                     color: myColor.current,
                     x,
                     y,
@@ -79,22 +95,18 @@ export const useCollaborativeCursors = (projectId: string) => {
             }
         };
 
-        // Throttle updates? For now, raw JS event
-        const throttledMove = (e: MouseEvent) => {
-            requestAnimationFrame(() => handleMouseMove(e));
-        };
-
         if (containerRef.current) {
-            containerRef.current.addEventListener('mousemove', throttledMove);
+            containerRef.current.addEventListener('mousemove', handleMouseMove);
         }
 
         return () => {
             if (containerRef.current) {
-                containerRef.current.removeEventListener('mousemove', throttledMove);
+                containerRef.current.removeEventListener('mousemove', handleMouseMove);
             }
             supabase.removeChannel(channel);
         };
-    }, [projectId, user, supabase, profile]);
+        // Removed 'profile' from dependencies to prevent reconnection loops
+    }, [projectId, user, supabase]);
 
     return { cursors, containerRef };
 };

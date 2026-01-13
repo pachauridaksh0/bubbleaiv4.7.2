@@ -90,13 +90,14 @@ export const CreditSystemSettings: React.FC = () => {
                 <NumberInput label="Admin Tier" value={settings.daily_credits_admin || 0} onChange={v => handleSettingChange('daily_credits_admin', v)} />
             </div>
 
-            <h3 className="text-lg font-semibold text-white pt-4 border-t border-white/10">User Chat Costs</h3>
+            <h3 className="text-lg font-semibold text-white pt-4 border-t border-white/10">System Costs</h3>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                  <NumberInput 
                     label="Cost per Interaction (Credits)" 
-                    value={settings.cost_chat_gemini_flash_lite || 0} 
-                    onChange={v => handleSettingChange('cost_chat_gemini_flash_lite', v)} 
-                    description="Amount deducted when a user sends a message without their own API key."
+                    // FIX: Ensure this points to cost_per_interaction, falling back to 0.5
+                    value={settings.cost_per_interaction !== undefined ? settings.cost_per_interaction : 0.5} 
+                    onChange={v => handleSettingChange('cost_per_interaction' as any, v)} 
+                    description="Amount deducted when a user uses the Admin API Key fallback."
                     isCurrency
                  />
             </div>

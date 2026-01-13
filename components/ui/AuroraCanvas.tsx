@@ -1,14 +1,22 @@
 
-import React, { useRef, useEffect } from "react";
+import React, { useRef, useEffect, useState } from "react";
 
 export default function AuroraCanvas() {
-  const canvasRef = useRef(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [shouldRender, setShouldRender] = useState(true);
 
   useEffect(() => {
+    // Mobile performance check
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || window.innerWidth < 768;
+    if (isMobile) {
+        setShouldRender(false);
+        return;
+    }
+
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    let gl;
+    let gl: WebGLRenderingContext | null = null;
     try {
       gl = canvas.getContext("webgl");
       if (!gl) throw new Error("WebGL not supported");
@@ -17,7 +25,7 @@ export default function AuroraCanvas() {
       return;
     }
 
-    let animationFrameId;
+    let animationFrameId: number;
 
     const setup = () => {
       if (!gl) return;
@@ -87,14 +95,14 @@ export default function AuroraCanvas() {
         }
       `;
 
-      const compileShader = (type, source) => {
-        const shader = gl.createShader(type);
+      const compileShader = (type: number, source: string) => {
+        const shader = gl!.createShader(type);
         if (!shader) return null;
-        gl.shaderSource(shader, source);
-        gl.compileShader(shader);
-        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-          console.error("Shader compile error:", gl.getShaderInfoLog(shader));
-          gl.deleteShader(shader);
+        gl!.shaderSource(shader, source);
+        gl!.compileShader(shader);
+        if (!gl!.getShaderParameter(shader, gl!.COMPILE_STATUS)) {
+          console.error("Shader compile error:", gl!.getShaderInfoLog(shader));
+          gl!.deleteShader(shader);
           return null;
         }
         return shader;
@@ -124,7 +132,7 @@ export default function AuroraCanvas() {
       const u_time = gl.getUniformLocation(program, "u_time");
       const u_resolution = gl.getUniformLocation(program, "u_resolution");
 
-      const render = (time) => {
+      const render = (time: number) => {
         if (!gl) return;
         gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
         gl.clearColor(0.0, 0.0, 0.0, 1.0);
@@ -153,6 +161,8 @@ export default function AuroraCanvas() {
       cancelAnimationFrame(animationFrameId);
     };
   }, []);
+
+  if (!shouldRender) return null;
 
   return <canvas ref={canvasRef} className="aurora-background absolute inset-0 w-full h-full -z-10" style={{ filter: "blur(80px)", opacity: 0.6 }} />;
 }

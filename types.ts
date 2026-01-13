@@ -96,8 +96,11 @@ export interface AppSettings {
     cost_chat_gemini_1_5_flash: number;
     cost_chat_gemini_flash_lite: number;
     updated_at: string;
-    admin_gemini_key?: string;
+    // UPDATED: Replaced admin_gemini_key with openai keys
+    admin_openai_key?: string;
     admin_deepseek_key?: string;
+    admin_system_model?: string; // e.g. "gpt-4o"
+    cost_per_interaction?: number;
 }
 
 export interface OnboardingPreferences {

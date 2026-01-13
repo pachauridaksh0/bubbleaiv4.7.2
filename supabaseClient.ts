@@ -30,5 +30,11 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     persistSession: true,
     detectSessionInUrl: true, // Enable hash parsing for Magic Links/Email Verification
     flowType: 'pkce', // Use PKCE flow for better security and persistence reliability
+  },
+  realtime: {
+    params: {
+      eventsPerSecond: 10, // Limit events to prevent flooding
+    },
+    heartbeatIntervalMs: 30000, // Keep connection alive
   }
 });

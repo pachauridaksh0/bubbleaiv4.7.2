@@ -28,8 +28,14 @@ const normalizeModelName = (model: string): string => {
     if (normalized.includes('gemini-1.5-pro') || normalized === 'gemini-pro') {
         return 'gemini-3-pro-preview';
     }
-    if (normalized.includes('gemini-1.5-flash')) {
-        return 'gemini-2.5-flash';
+    // Change old Flash to new Lite
+    if (normalized.includes('gemini-1.5-flash') || normalized.includes('gemini-flash-lite')) {
+        return 'gemini-2.0-flash-lite-preview-02-05';
+    }
+    
+    // Normalize DeepSeek requests to general chat endpoint if specific free one fails/is requested
+    if (normalized.includes('deepseek')) {
+        return 'deepseek/deepseek-chat'; 
     }
     
     return normalized;

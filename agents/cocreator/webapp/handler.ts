@@ -5,7 +5,7 @@ import { webAppAgentInstruction, webAppArchitectInstruction } from './instructio
 import { getUserFriendlyError } from '../../errorUtils';
 import { Project, Plan, Task } from '../../../types';
 
-// Helper for retrying Gemini calls
+// Helper for retrying Gemini calls with robust fallback
 const generateContentStreamWithRetry = async (
     ai: GoogleGenAI, 
     params: any, 
@@ -16,6 +16,26 @@ const generateContentStreamWithRetry = async (
         try {
             return await ai.models.generateContentStream(params);
         } catch (error: any) {
+            const isNotFound = error.status === 404 || error.status === 400 || (error.message && (error.message.includes('404') || error.message.includes('not found') || error.message.includes('Requested entity was not found')));
+            
+            if (isNotFound) {
+                const currentModel = params.model;
+                // FALLBACK CHANGE: Use Gemini 2.0 Flash Lite Preview as requested
+                let nextModel = 'gemini-2.0-flash-lite-preview-02-05'; 
+
+                if (currentModel === nextModel) {
+                     // We are already at the bottom of the fallback chain
+                     throw error;
+                }
+
+                console.warn(`Model ${currentModel} failed (404). Switching to ${nextModel}.`);
+                if (onRetry) onRetry(`(Model ${currentModel} unavailable. Switching to ${nextModel}...)`);
+                
+                params.model = nextModel;
+                // Reset attempt counter to give the new model a fair chance
+                continue; 
+            }
+
             const isQuotaError = error.status === 429 || 
                                  (error.message && error.message.includes('429')) ||
                                  (error.message && error.message.includes('quota'));
@@ -40,7 +60,6 @@ class WebStreamingResponseParser {
     private currentContent: string = "";
     
     // Matches start tags like [FILE: path/to/file.lua]
-    // Tolerates extra spaces
     private startTagRegex = /\[\s*FILE\s*:\s*(.*?)\s*\]/i;
     
     constructor(
@@ -50,9 +69,7 @@ class WebStreamingResponseParser {
 
     // Helper to strip markdown fences from code
     private cleanContent(content: string): string {
-        // 1. Remove initial markdown fence if present (e.g. ```html\n)
         let cleaned = content.replace(/^\s*```[a-zA-Z0-9]*\s*\n?/i, '');
-        // 2. Remove closing markdown fence if present (e.g. \n```) at the very end
         cleaned = cleaned.replace(/\n?\s*```\s*$/, '');
         return cleaned;
     }
@@ -89,37 +106,27 @@ class WebStreamingResponseParser {
                 const endTag = '[/FILE]';
                 const endTagIndex = this.buffer.indexOf(endTag);
                 if (endTagIndex !== -1) {
-                    // FILE COMPLETE
                     const contentChunk = this.buffer.substring(0, endTagIndex);
                     this.currentContent += contentChunk;
-                    
-                    // Clean the final content aggressively
                     const finalContent = this.cleanContent(this.currentContent);
-                    
                     if (this.currentFilePath) {
                         this.onFileUpdate(this.currentFilePath, finalContent, true);
                     }
-                    
                     let remaining = this.buffer.substring(endTagIndex + endTag.length);
-                    // Swallow trailing newline after [/FILE]
                     const trimMatch = remaining.match(/^\s*[\r\n]+/);
                     if (trimMatch) remaining = remaining.substring(trimMatch[0].length);
-                    
                     this.buffer = remaining;
                     this.mode = 'TEXT';
                     this.currentFilePath = null;
                     processed = true;
                 } else {
-                    // FILE STREAMING
                     const safetyThreshold = 10; 
                     if (this.buffer.length > safetyThreshold) {
                         const safeLength = this.buffer.length - safetyThreshold;
                         const contentChunk = this.buffer.substring(0, safeLength);
                         this.currentContent += contentChunk;
                         this.buffer = this.buffer.substring(safeLength);
-                        
                         if (this.currentFilePath) {
-                            // Clean content even during streaming so UI doesn't show backticks
                             const cleanStreamingContent = this.cleanContent(this.currentContent);
                             this.onFileUpdate(this.currentFilePath, cleanStreamingContent, false);
                         }
@@ -141,14 +148,11 @@ export const runWebAppAgent = async (input: AgentInput): Promise<AgentExecutionR
     
     const ai = new GoogleGenAI({ apiKey });
 
-    // 1. DETERMINE MODEL & CAPABILITIES
-    // PRIORITIZE: Input model (from useChat calculation) > Profile preference > Default
-    // This ensures that if the user selects a specific builder agent/model in settings (which is passed via input.model), it is respected.
-    let model = input.model || profile?.preferred_code_model || 'gemini-flash-lite-latest';
+    // 1. DETERMINE MODEL (With safer defaults)
+    let model = input.model || profile?.preferred_code_model || 'gemini-2.0-flash-lite-preview-02-05';
     
-    // Normalize deprecated models
-    if (model.includes('gemini-1.5-pro')) model = 'gemini-3-pro-preview';
-    if (model.includes('gemini-1.5-flash') || model.includes('gemini-2.5-flash')) model = 'gemini-flash-lite-latest';
+    if (model === 'gemini-flash-lite-latest') model = 'gemini-2.0-flash-lite-preview-02-05';
+    if (model.includes('gemini-1.5-pro')) model = 'gemini-2.0-flash-lite-preview-02-05'; 
     
     const supportsSearch = model.includes('gemini') || model.includes('google');
 
@@ -159,7 +163,9 @@ export const runWebAppAgent = async (input: AgentInput): Promise<AgentExecutionR
         fileContext += '\n\n=== CURRENT PROJECT FILES ===\n';
         for (const [path, file] of Object.entries(project.files || {})) {
             const content = file.content;
-            const snippet = content.length > 3000 ? content.substring(0, 3000) + "\n...[truncated]..." : content;
+            // Increased limit to 30,000 chars as newer models handle 1M+ context
+            // Changed truncation indicator to a comment to prevent syntax errors if AI copies it
+            const snippet = content.length > 30000 ? content.substring(0, 30000) + "\n\n// ... [File Truncated by System] ...\n" : content;
             fileContext += `\n[FILE: ${path}]\n${snippet}\n[/FILE]\n`;
         }
     } else {
@@ -176,11 +182,10 @@ export const runWebAppAgent = async (input: AgentInput): Promise<AgentExecutionR
 
     try {
         // === STEP 0: INTENT CLASSIFICATION ===
-        // Determine if this is a QUESTION (no code needed) or a CHANGE (code needed).
         let intent = "CHANGE";
         try {
             const classifierResponse = await ai.models.generateContent({
-                model: 'gemini-flash-lite-latest',
+                model: 'gemini-2.0-flash-lite-preview-02-05',
                 contents: `USER PROMPT: "${prompt}"\n\nClassify this request into "QUESTION" (user is asking for explanation, help, or status) or "CHANGE" (user wants to modify, add, or fix code). Return JSON: { "intent": "QUESTION" | "CHANGE" }`,
                 config: { responseMimeType: "application/json" }
             });
@@ -193,7 +198,6 @@ export const runWebAppAgent = async (input: AgentInput): Promise<AgentExecutionR
         if (intent === "QUESTION") {
             onStreamChunk?.("Thinking about your question... 🤔\n");
             
-            // Just run a standard chat response with context
             const questionStream = await generateContentStreamWithRetry(ai, {
                 model: model,
                 contents: [...geminiHistory, { role: 'user', parts: [{ text: `User Question: "${prompt}". \n\nCONTEXT:\n${fileContext}\n\nAnswer the user's question. Do NOT generate code blocks for file updates.` }] }],
@@ -212,22 +216,20 @@ export const runWebAppAgent = async (input: AgentInput): Promise<AgentExecutionR
                 chat_id: chat.id,
                 sender: 'ai',
                 text: answerText,
-                model: model // Store model used
+                model: model 
             };
             return { messages: [message] };
         }
 
 
         // === PHASE 1: THE ARCHITECT (Thinking/Planning) ===
-        // This runs FIRST to analyze the request deeply using the 7 Principles.
         
-        onStreamChunk?.("<THINK>\n"); // Open the UI thinking block
+        onStreamChunk?.("<THINK>\n"); 
         cleanResponseText += "<THINK>\n";
 
         let architecturalPlan = "";
         
         try {
-            // We use the Architect Instruction which enforces the 7 Principles
             const architectHistory = [...geminiHistory, { role: 'user', parts: [{ text: `
 MEMORY CONTEXT:
 ${memoryContext || 'No memory context.'}
@@ -242,15 +244,8 @@ ACTION:
 Perform the Architectural Analysis now.
 ` }]}];
 
-            // Use a smart model for architecture if possible (Pro > Flash Lite)
-            // But if user requested Lite, respect it if possible, or upgrade lightly.
-            // Architect needs reasoning. Flash Lite is weaker. Upgrade to Pro for architect if possible?
-            // User requested "Gemini Flash Lite" to replace 2.5 Flash. Let's try to stick to efficient models.
-            // 2.5 Flash was efficient. Flash Lite is very efficient. 
-            // Let's default architect to 'gemini-flash-lite-latest' but keep search.
-            const architectModel = model.includes('lite') ? 'gemini-flash-lite-latest' : model; 
-            
-            // Try to use search if available for the architect to "Explore Design Space"
+            // Use stable 2.0 Flash Lite for architecture
+            const architectModel = 'gemini-2.0-flash-lite-preview-02-05';
             const tools = supportsSearch ? [{ googleSearch: {} }] : undefined;
 
             const architectStream = await generateContentStreamWithRetry(ai, {
@@ -259,14 +254,13 @@ Perform the Architectural Analysis now.
                 config: {
                     systemInstruction: webAppArchitectInstruction,
                     tools: tools,
-                    temperature: 0.7, // Creativity for design
+                    temperature: 0.7,
                 }
-            }, 2);
+            }, 2, (msg) => onStreamChunk?.(msg));
 
             for await (const chunk of architectStream) {
                 if (chunk.text) {
                     architecturalPlan += chunk.text;
-                    // Stream to user inside the thinking block
                     onStreamChunk?.(chunk.text);
                     cleanResponseText += chunk.text;
                 }
@@ -280,12 +274,11 @@ Perform the Architectural Analysis now.
             architecturalPlan = "Analysis skipped. Follow user prompt directly.";
         }
 
-        onStreamChunk?.("\n</THINK>\n\n"); // Close the UI thinking block
+        onStreamChunk?.("\n</THINK>\n\n");
         cleanResponseText += "\n</THINK>\n\n";
 
 
         // === PHASE 2: THE BUILDER (Coding) ===
-        // Now we run the actual code generation, armed with the Architect's plan.
 
         const builderPrompt = `
 Here is the **Design Document** and Analysis provided by the Lead Architect:
@@ -298,9 +291,9 @@ INSTRUCTIONS:
 1.  Implement the solution described above.
 2.  Follow the **Quality Rules** (Realistic data, Error states, Accessibility).
 3.  Generate ALL necessary files using the \`[FILE: path]...[/FILE]\` format.
+4.  **IMPORTANT:** If you see any file content marked as '...[File Truncated]...', DO NOT write that back into the file. You must generate complete, valid code for the entire file.
 `;
 
-        // The builder sees the history + the new prompt containing the plan
         const builderContents = [
             ...geminiHistory, 
             { role: 'user', parts: [{ text: builderPrompt }] }
@@ -317,15 +310,16 @@ INSTRUCTIONS:
             }
         );
 
+        // Build stream uses the requested model, but with fallback protection
         const buildStream = await generateContentStreamWithRetry(ai, {
-            model: model, // Use the user's preferred coding model passed in INPUT
+            model: model, 
             contents: builderContents,
             config: {
                 systemInstruction: `${webAppAgentInstruction}\n\n${fileContext}`,
-                temperature: 0.4, // Precision for code
-                maxOutputTokens: 65536 // High limit for full apps
+                temperature: 0.2, // Reduced temperature for more stable code generation
+                maxOutputTokens: 65536 
             }
-        }, 3);
+        }, 3, (msg) => onStreamChunk?.(msg));
 
         for await (const chunk of buildStream) {
             if (chunk.text) {
@@ -339,7 +333,7 @@ INSTRUCTIONS:
             chat_id: chat.id,
             sender: 'ai',
             text: cleanResponseText,
-            model: model // Store model used
+            model: model
         };
 
         return { messages: [message], projectUpdate: { files: newFilesState } };

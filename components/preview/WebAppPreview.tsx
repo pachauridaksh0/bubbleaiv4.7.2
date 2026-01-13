@@ -30,6 +30,11 @@ export const WebAppPreview: React.FC<WebAppPreviewProps> = ({ project, onFixErro
   const [isLogOpen, setIsLogOpen] = useState(false);
   const [buildStatus, setBuildStatus] = useState<'idle' | 'building' | 'success' | 'error'>('idle');
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const buildTimeoutRef = useRef<any>(null); // Debounce ref for building
+  
+  // ERROR BATCHING REFS
+  const errorBufferRef = useRef<Set<string>>(new Set());
+  const errorDebounceRef = useRef<any>(null);
 
   const addLog = useCallback((message: string, type: 'info' | 'error' | 'success' | 'warning' = 'info') => {
       setLogs(prev => [...prev, {
@@ -38,19 +43,29 @@ export const WebAppPreview: React.FC<WebAppPreviewProps> = ({ project, onFixErro
           message,
           timestamp: new Date()
       }]);
+      
       if (type === 'error') {
           setBuildStatus('error');
-          // If a callback is provided, report the error up
-          if (onFixError) {
-              onFixError(message);
+          
+          // Accumulate errors
+          errorBufferRef.current.add(message);
+          
+          // Debounce the notification to parent
+          if (errorDebounceRef.current) {
+              clearTimeout(errorDebounceRef.current);
           }
+          
+          errorDebounceRef.current = setTimeout(() => {
+              if (onFixError && errorBufferRef.current.size > 0) {
+                  // Join all unique errors with clear separation
+                  const allErrors = Array.from(errorBufferRef.current).join('\n\n');
+                  onFixError(allErrors);
+                  // Do NOT clear buffer here immediately, as more might come. 
+                  // Rely on new build start to clear.
+              }
+          }, 800); // Wait 800ms for other errors to arrive
       }
   }, [onFixError]);
-
-  useEffect(() => {
-      setBuildStatus('idle');
-      addLog('--- Project Updated ---', 'info');
-  }, [project.files, addLog]);
 
   const handleDownload = async () => {
       if (!project.files) return;
@@ -96,260 +111,262 @@ export const WebAppPreview: React.FC<WebAppPreviewProps> = ({ project, onFixErro
   };
 
   useEffect(() => {
+    // Debounce build Trigger
+    if (buildTimeoutRef.current) {
+        clearTimeout(buildTimeoutRef.current);
+    }
+    
     if (!project.files || Object.keys(project.files).length === 0) {
         setIframeUrl(null);
         return;
     }
 
+    addLog('File change detected, queueing build...', 'info');
+    
+    buildTimeoutRef.current = setTimeout(() => {
+        runBuildProcess();
+    }, 1500); // 1.5s debounce to prevent "running again and again" during stream
+
+    return () => {
+        if (buildTimeoutRef.current) clearTimeout(buildTimeoutRef.current);
+    };
+  }, [project.files]); // Trigger on files change
+
+  const runBuildProcess = async () => {
     setIsBuilding(true);
     setBuildStatus('building');
     setLogs([]);
+    errorBufferRef.current.clear(); // Clear previous error buffer
     addLog('Starting build...', 'info');
 
-    const build = async () => {
-        try {
-            const files = project.files || {};
+    try {
+        const files = project.files || {};
+        
+        const entryFile = Object.keys(files).find(f => f.match(/src\/(main|index)\.(tsx|jsx|ts|js)$/));
+        const htmlFileKey = Object.keys(files).find(f => f.endsWith('index.html'));
+        
+        if (!entryFile) {
+            throw new Error("Missing entry file (e.g., src/main.tsx).");
+        }
+        addLog(`Entry point found: ${entryFile}`, 'info');
+
+        let htmlContent = htmlFileKey ? files[htmlFileKey].content : '<div id="root"></div>';
+        htmlContent = htmlContent.replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, ""); 
+
+        const serializedFiles = JSON.stringify(files).replace(/<\/script>/g, '<\\/script>');
+        
+        const bundlerScript = `
+            window.onerror = function(msg, url, line, col, error) {
+                window.parent.postMessage({ type: 'PREVIEW_LOG', log: { type: 'error', message: msg + ' (' + url + ':' + line + ')' } }, '*');
+                return false;
+            };
+
+            console.log = function(...args) {
+                window.parent.postMessage({ type: 'PREVIEW_LOG', log: { type: 'info', message: args.join(' ') } }, '*');
+            };
             
-            const entryFile = Object.keys(files).find(f => f.match(/src\/(main|index)\.(tsx|jsx|ts|js)$/));
-            const htmlFileKey = Object.keys(files).find(f => f.endsWith('index.html'));
-            
-            if (!entryFile) {
-                throw new Error("Missing entry file (e.g., src/main.tsx).");
+            console.error = function(...args) {
+                window.parent.postMessage({ type: 'PREVIEW_LOG', log: { type: 'error', message: args.join(' ') } }, '*');
+            };
+
+            // Helper to create safe data URIs for UTF-8 content
+            function toDataUri(content, mimeType) {
+                return 'data:' + mimeType + ';base64,' + btoa(unescape(encodeURIComponent(content)));
             }
-            addLog(`Entry point found: ${entryFile}`, 'info');
 
-            let htmlContent = htmlFileKey ? files[htmlFileKey].content : '<div id="root"></div>';
-            htmlContent = htmlContent.replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, ""); 
-
-            const serializedFiles = JSON.stringify(files).replace(/<\/script>/g, '<\\/script>');
-            
-            const bundlerScript = `
-                window.onerror = function(msg, url, line, col, error) {
-                    window.parent.postMessage({ type: 'PREVIEW_LOG', log: { type: 'error', message: msg } }, '*');
-                    return false;
-                };
-
-                console.log = function(...args) {
-                    window.parent.postMessage({ type: 'PREVIEW_LOG', log: { type: 'info', message: args.join(' ') } }, '*');
-                };
-                
-                console.error = function(...args) {
-                    window.parent.postMessage({ type: 'PREVIEW_LOG', log: { type: 'error', message: args.join(' ') } }, '*');
-                };
-
-                // Helper to create safe data URIs for UTF-8 content
-                function toDataUri(content, mimeType) {
-                    return 'data:' + mimeType + ';base64,' + btoa(unescape(encodeURIComponent(content)));
-                }
-
-                async function boot() {
-                    try {
-                        console.log("Initializing Virtual File System...");
-                        const files = ${serializedFiles};
-                        
-                        function resolvePath(base, relative) {
-                            const stack = base.split('/');
-                            stack.pop(); 
-                            const parts = relative.split('/');
-                            for (let i = 0; i < parts.length; i++) {
-                                if (parts[i] === '.') continue;
-                                if (parts[i] === '..') stack.pop();
-                                else stack.push(parts[i]);
-                            }
-                            return stack.join('/');
+            async function boot() {
+                try {
+                    console.log("Initializing Virtual File System...");
+                    const files = ${serializedFiles};
+                    
+                    function resolvePath(base, relative) {
+                        const stack = base.split('/');
+                        stack.pop(); 
+                        const parts = relative.split('/');
+                        for (let i = 0; i < parts.length; i++) {
+                            if (parts[i] === '.') continue;
+                            if (parts[i] === '..') stack.pop();
+                            else stack.push(parts[i]);
                         }
+                        return stack.join('/');
+                    }
 
-                        // Inject CSS
-                        for (const [path, file] of Object.entries(files)) {
-                            const fileContent = (file).content;
-                            if (path.endsWith('.css')) {
-                                const style = document.createElement('style');
-                                style.textContent = fileContent;
-                                document.head.appendChild(style);
-                                console.log("Injected CSS: " + path);
-                            }
+                    // Inject CSS
+                    for (const [path, file] of Object.entries(files)) {
+                        const fileContent = (file).content;
+                        if (path.endsWith('.css')) {
+                            const style = document.createElement('style');
+                            style.textContent = fileContent;
+                            document.head.appendChild(style);
+                            console.log("Injected CSS: " + path);
                         }
+                    }
 
-                        const importMap = { imports: {} };
-                        
-                        // CONSTANT: Pin React Version to prevent duplicate instances
-                        const reactVersion = '18.2.0';
-                        const deps = \`react@\${reactVersion},react-dom@\${reactVersion}\`;
+                    const importMap = { imports: {} };
+                    
+                    // CONSTANT: Pin React Version to prevent duplicate instances
+                    const reactVersion = '18.2.0';
+                    const deps = \`react@\${reactVersion},react-dom@\${reactVersion}\`;
 
-                        // External Libs - Using esm.sh with pinned dependencies
-                        importMap.imports['react'] = \`https://esm.sh/react@\${reactVersion}?dev\`;
-                        importMap.imports['react-dom/client'] = \`https://esm.sh/react-dom@\${reactVersion}/client?dev&deps=\${deps}\`;
-                        importMap.imports['react/jsx-runtime'] = \`https://esm.sh/react@\${reactVersion}/jsx-runtime?dev&deps=\${deps}\`;
-                        
-                        // Force third-party libs to use the SAME React instance
-                        importMap.imports['clsx'] = 'https://esm.sh/clsx';
-                        importMap.imports['tailwind-merge'] = 'https://esm.sh/tailwind-merge';
-                        importMap.imports['lucide-react'] = \`https://esm.sh/lucide-react?dev&deps=\${deps}\`;
-                        importMap.imports['framer-motion'] = \`https://esm.sh/framer-motion?dev&deps=\${deps}\`;
-                        importMap.imports['react-router-dom'] = \`https://esm.sh/react-router-dom?dev&deps=\${deps}\`;
-                        importMap.imports['recharts'] = \`https://esm.sh/recharts?dev&deps=\${deps}\`;
-                        importMap.imports['date-fns'] = 'https://esm.sh/date-fns';
-                        importMap.imports['react-markdown'] = \`https://esm.sh/react-markdown?dev&deps=\${deps}\`;
-                        // Explicitly add syntax highlighter to fix resolution issues
-                        importMap.imports['react-syntax-highlighter'] = \`https://esm.sh/react-syntax-highlighter?dev&deps=\${deps}\`;
-                        // Map specific style paths often used by AI
-                        importMap.imports['react-syntax-highlighter/dist/esm/styles/prism'] = \`https://esm.sh/react-syntax-highlighter/dist/esm/styles/prism?dev&deps=\${deps}\`;
-                        importMap.imports['react-syntax-highlighter/dist/esm/styles/hljs'] = \`https://esm.sh/react-syntax-highlighter/dist/esm/styles/hljs?dev&deps=\${deps}\`;
-                        
-                        // Helper to catch wildcard style imports if exact match fails
-                        // Note: Browsers strictly follow import maps, so we can't do true wildcards, 
-                        // but we can add common subpaths if needed. 
-                        // For now, the explicit ones above cover 90% of AI usage.
-                        
-                        console.log("Transpiling modules...");
-                        
-                        for (const [path, file] of Object.entries(files)) {
-                            if (!path.match(/\\.(tsx|ts|jsx|js|mjs|cjs)$/)) continue;
-                            
-                            const fileContent = file.content;
+                    // External Libs - Using esm.sh with pinned dependencies
+                    importMap.imports['react'] = \`https://esm.sh/react@\${reactVersion}?dev\`;
+                    importMap.imports['react-dom/client'] = \`https://esm.sh/react-dom@\${reactVersion}/client?dev&deps=\${deps}\`;
+                    importMap.imports['react/jsx-runtime'] = \`https://esm.sh/react@\${reactVersion}/jsx-runtime?dev&deps=\${deps}\`;
+                    
+                    // Explicitly define common libs to help resolution
+                    const commonLibs = ['clsx', 'tailwind-merge', 'lucide-react', 'framer-motion', 'react-router-dom', 'recharts', 'date-fns'];
+                    commonLibs.forEach(lib => {
+                        importMap.imports[lib] = \`https://esm.sh/\${lib}?dev&deps=\${deps}\`;
+                    });
 
-                            try {
-                                const { code } = Babel.transform(fileContent, {
-                                    presets: [
-                                        ['react', { runtime: 'automatic' }], 
-                                        'typescript'
-                                    ],
-                                    filename: path,
-                                });
+                    console.log("Transpiling modules...");
+                    
+                    for (const [path, file] of Object.entries(files)) {
+                        if (!path.match(/\\.(tsx|ts|jsx|js|mjs|cjs)$/)) continue;
+                        
+                        const fileContent = file.content;
 
-                                // Rewrite imports to absolute "https://project/..." paths
-                                const { code: finalCode } = Babel.transform(code, {
-                                    plugins: [{
-                                        visitor: {
-                                            // Handle: import x from 'y'; import 'y';
-                                            ImportDeclaration(p) {
-                                                if (p.node.source) processNode(p.node.source, p);
-                                            },
-                                            // Handle: export { x } from 'y';
-                                            ExportNamedDeclaration(p) {
-                                                if (p.node.source) processNode(p.node.source, p);
-                                            },
-                                            // Handle: export * from 'y';
-                                            ExportAllDeclaration(p) {
-                                                if (p.node.source) processNode(p.node.source, p);
-                                            },
-                                            // Handle: await import('y');
-                                            CallExpression(p) {
-                                                if (p.node.callee.type === 'Import' && p.node.arguments.length > 0) {
-                                                    if (p.node.arguments[0].type === 'StringLiteral') {
-                                                        processNode(p.node.arguments[0], p);
-                                                    }
+                        try {
+                            const { code } = Babel.transform(fileContent, {
+                                presets: [
+                                    ['react', { runtime: 'automatic' }], 
+                                    'typescript'
+                                ],
+                                filename: path,
+                            });
+
+                            // Rewrite imports to absolute "https://project/..." paths
+                            const { code: finalCode } = Babel.transform(code, {
+                                plugins: [{
+                                    visitor: {
+                                        // Handle: import x from 'y'; import 'y';
+                                        ImportDeclaration(p) {
+                                            if (p.node.source) processNode(p.node.source, p);
+                                        },
+                                        // Handle: export { x } from 'y';
+                                        ExportNamedDeclaration(p) {
+                                            if (p.node.source) processNode(p.node.source, p);
+                                        },
+                                        // Handle: export * from 'y';
+                                        ExportAllDeclaration(p) {
+                                            if (p.node.source) processNode(p.node.source, p);
+                                        },
+                                        // Handle: await import('y');
+                                        CallExpression(p) {
+                                            if (p.node.callee.type === 'Import' && p.node.arguments.length > 0) {
+                                                if (p.node.arguments[0].type === 'StringLiteral') {
+                                                    processNode(p.node.arguments[0], p);
                                                 }
                                             }
                                         }
-                                    }]
-                                });
-                                
-                                // Internal helper for the visitor
-                                function processNode(sourceNode, pathObj) {
-                                    const source = sourceNode.value;
-                                    
-                                    // STRIP CSS IMPORTS
-                                    if (source.endsWith('.css')) {
-                                        if (pathObj && typeof pathObj.remove === 'function') {
-                                            pathObj.remove();
-                                        }
-                                        return;
                                     }
+                                }]
+                            });
+                            
+                            // Internal helper for the visitor
+                            function processNode(sourceNode, pathObj) {
+                                const source = sourceNode.value;
+                                
+                                // STRIP CSS IMPORTS
+                                if (source.endsWith('.css')) {
+                                    if (pathObj && typeof pathObj.remove === 'function') {
+                                        pathObj.remove();
+                                    }
+                                    return;
+                                }
 
-                                    if (source.startsWith('.')) {
-                                        const resolved = resolvePath(path, source);
-                                        sourceNode.value = 'https://project/' + resolved;
-                                    } else {
-                                        if (!importMap.imports[source]) {
-                                            if (!['react', 'react-dom'].some(k => source.includes(k))) {
-                                                 sourceNode.value = \`https://esm.sh/\${source}?dev&deps=\${deps}\`;
-                                            }
-                                        }
+                                // 1. Relative Imports
+                                if (source.startsWith('.')) {
+                                    const resolved = resolvePath(path, source);
+                                    sourceNode.value = 'https://project/' + resolved;
+                                } 
+                                // 2. Bare Modules (not relative, not absolute URL) -> ESM.SH
+                                else if (!source.startsWith('https://') && !source.startsWith('http://')) {
+                                    if (!importMap.imports[source]) {
+                                        // Auto-rewrite any unknown bare module to esm.sh
+                                        // This fixes "@headlessui/react" errors
+                                        sourceNode.value = \`https://esm.sh/\${source}?dev&deps=\${deps}\`;
                                     }
                                 }
-                                
-                                const dataUri = toDataUri(finalCode, 'text/javascript');
-                                
-                                const absPath = 'https://project/' + path;
-                                importMap.imports[absPath] = dataUri;
-                                importMap.imports[absPath.replace(/\\.(tsx|ts|jsx|js|mjs|cjs)$/, '')] = dataUri;
-                                
-                            } catch (e) {
-                                console.error("Babel Error in " + path + ": " + e.message);
                             }
+                            
+                            const dataUri = toDataUri(finalCode, 'text/javascript');
+                            
+                            const absPath = 'https://project/' + path;
+                            importMap.imports[absPath] = dataUri;
+                            importMap.imports[absPath.replace(/\\.(tsx|ts|jsx|js|mjs|cjs)$/, '')] = dataUri;
+                            
+                        } catch (e) {
+                            console.error("Babel Error in " + path + ": " + e.message);
                         }
-                        
-                        const mapEl = document.createElement('script');
-                        mapEl.type = 'importmap';
-                        mapEl.textContent = JSON.stringify(importMap);
-                        document.head.appendChild(mapEl);
-                        
-                        console.log("Import Map Injected.");
-
-                        // Start
-                        const entryKey = "https://project/${entryFile}";
-                        console.log("Booting from: " + entryKey);
-                        
-                        setTimeout(() => {
-                            import(entryKey)
-                                .then(() => {
-                                    window.parent.postMessage({ type: 'PREVIEW_LOG', log: { type: 'success', message: 'Build complete. App running.' } }, '*');
-                                })
-                                .catch(e => {
-                                    console.error("Runtime Boot Error: " + e.message);
-                                });
-                        }, 50);
-
-                    } catch (e) {
-                        console.error("Bootloader Error: " + e.message);
                     }
+                    
+                    const mapEl = document.createElement('script');
+                    mapEl.type = 'importmap';
+                    mapEl.textContent = JSON.stringify(importMap);
+                    document.head.appendChild(mapEl);
+                    
+                    console.log("Import Map Injected.");
+
+                    // Start
+                    const entryKey = "https://project/${entryFile}";
+                    console.log("Booting from: " + entryKey);
+                    
+                    setTimeout(() => {
+                        import(entryKey)
+                            .then(() => {
+                                window.parent.postMessage({ type: 'PREVIEW_LOG', log: { type: 'success', message: 'Build complete. App running.' } }, '*');
+                            })
+                            .catch(e => {
+                                console.error("Runtime Boot Error: " + e.message);
+                            });
+                    }, 50);
+
+                } catch (e) {
+                    console.error("Bootloader Error: " + e.message);
                 }
-                
-                boot();
-            `;
-
-            const finalHtml = `
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="UTF-8" />
-                    <script src="https://cdn.tailwindcss.com"></script>
-                    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-                    <style>
-                        body { background-color: #ffffff; color: #000; font-family: sans-serif; margin: 0; }
-                        #root { width: 100%; min-height: 100vh; }
-                    </style>
-                </head>
-                <body>
-                    ${htmlContent}
-                    <script>${bundlerScript}</script>
-                </body>
-                </html>
-            `;
-
-            const blob = new Blob([finalHtml], { type: 'text/html' });
-            const url = URL.createObjectURL(blob);
-            setIframeUrl(url);
+            }
             
-            setTimeout(() => {
-                setIsBuilding(false);
-                setBuildStatus('success');
-            }, 1000);
+            boot();
+        `;
 
-            return () => URL.revokeObjectURL(url);
+        const finalHtml = `
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8" />
+                <script src="https://cdn.tailwindcss.com"></script>
+                <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+                <style>
+                    body { background-color: #ffffff; color: #000; font-family: sans-serif; margin: 0; }
+                    #root { width: 100%; min-height: 100vh; }
+                </style>
+            </head>
+            <body>
+                ${htmlContent}
+                <script>${bundlerScript}</script>
+            </body>
+            </html>
+        `;
 
-        } catch (e: any) {
-            addLog(e.message, 'error');
+        const blob = new Blob([finalHtml], { type: 'text/html' });
+        const url = URL.createObjectURL(blob);
+        setIframeUrl(url);
+        
+        setTimeout(() => {
             setIsBuilding(false);
-            setBuildStatus('error');
-        }
-    };
+            setBuildStatus('success');
+        }, 1000);
 
-    const cleanup = build();
-    return () => { cleanup.then(c => c && c()); };
+        // We do NOT revoke immediately to allow iframe refresh
+        // URL.revokeObjectURL(url); 
 
-  }, [project.files]);
+    } catch (e: any) {
+        addLog(e.message, 'error');
+        setIsBuilding(false);
+        setBuildStatus('error');
+    }
+  };
 
   useEffect(() => {
       const handleMessage = (event: MessageEvent) => {

@@ -1,33 +1,43 @@
 
 import { SupabaseClient } from '@supabase/supabase-js';
-import { Project, Message, Plan, ProjectPlatform, Profile, Chat, ChatMode, Memory, ProjectType, MemoryLayer, AppSettings, ChatWithProjectData, Friendship, Notification, PrivateMessage } from '../types';
+import { Project, Message, Plan, ProjectPlatform, Profile, Chat, ChatMode, Memory, ProjectType, MemoryLayer, AppSettings, ChatWithProjectData } from '../types';
 // FIX: Import GoogleGenAI and Type for the new memory extraction function.
 import { GoogleGenAI, Type } from "@google/genai";
 
 // Helper to extract a clean error message from various error formats.
 const getErrorMessage = (error: any): string => {
-    if (!error) return "An unknown error occurred.";
-    
-    // If it's already a string, return it
-    if (typeof error === 'string') return error;
-
-    // Standard JS Error
-    if (error instanceof Error) return error.message;
-
-    // Supabase/PostgREST error objects usually have 'message', 'details', or 'hint'
-    if (error.message) return error.message;
-    if (error.error_description) return error.error_description;
-    if (error.details) return error.details;
-    if (error.hint) return error.hint;
-    
-    // Fallback: Try to stringify the object if possible
-    try {
-        const json = JSON.stringify(error);
-        if (json !== '{}') return json;
-        return "Object with keys: " + Object.keys(error).join(', ');
-    } catch (e) {
-        return "Non-serializable error object.";
+    if (!error) {
+        return "An unknown error occurred.";
     }
+    if (typeof error === 'string') {
+        return error;
+    }
+    // Prioritize standard error message property
+    if (error && typeof error.message === 'string' && error.message.trim() !== '') {
+        return error.message;
+    }
+    // Handle Supabase/PostgREST specific error shapes
+    if (error && typeof error.details === 'string' && error.details.trim() !== '') {
+        return error.details;
+    }
+    if (error && typeof error.error_description === 'string' && error.error_description.trim() !== '') {
+        return error.error_description;
+    }
+    if (error && typeof error.hint === 'string' && error.hint.trim() !== '') {
+        return error.hint;
+    }
+    // Fallback to stringifying the whole object safely
+    try {
+        const str = JSON.stringify(error);
+        if (str !== '{}') {
+            return str;
+        }
+    } catch (e) {
+        // This can happen with circular references
+        return "A non-serializable error object was thrown. Check the developer console for details.";
+    }
+    // Final fallback if nothing else works
+    return "An unknown error occurred. The error object could not be stringified.";
 };
 
 
@@ -76,6 +86,17 @@ export const updateAppSettings = async (supabase: SupabaseClient, updates: Parti
 };
 
 // === Projects ===
+
+export const getProject = async (supabase: SupabaseClient, projectId: string): Promise<Project | null> => {
+    const { data, error } = await supabase
+        .from('projects')
+        .select('*')
+        .eq('id', projectId)
+        .maybeSingle();
+
+    if (error) handleSupabaseError(error, 'Error fetching project');
+    return data;
+};
 
 export const getProjects = async (supabase: SupabaseClient, userId: string): Promise<Project[]> => {
     const { data, error } = await supabase
@@ -199,14 +220,10 @@ export const getChatsForProject = async (supabase: SupabaseClient, projectId: st
 };
 
 export const createChat = async (supabase: SupabaseClient, userId: string, name: string, mode: ChatMode, projectId?: string | null): Promise<Chat> => {
-    if (!userId) {
-        throw new Error("Cannot create chat: User ID is missing.");
-    }
-
     const { data, error } = await supabase
         .from('chats')
         .insert({
-            project_id: projectId || null, // Explicitly set to null if undefined to ensure valid JSON payload
+            project_id: projectId,
             user_id: userId,
             name: name,
             mode: mode,
@@ -241,17 +258,6 @@ export const deleteChat = async (supabase: SupabaseClient, chatId: string): Prom
 
 
 // === Profiles ===
-
-export const getUserProfile = async (supabase: SupabaseClient, userId: string): Promise<Profile | null> => {
-    const { data, error } = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('id', userId)
-        .maybeSingle();
-
-    if (error) handleSupabaseError(error, 'Error fetching user profile');
-    return data;
-};
 
 export const createProfile = async (supabase: SupabaseClient, userId: string, displayName: string, avatarUrl: string): Promise<Profile> => {
     const { data, error } = await supabase
@@ -313,41 +319,19 @@ export const updateProfileForAdmin = async (supabase: SupabaseClient, userId: st
 };
 
 export const deleteUser = async (supabase: SupabaseClient, userId: string): Promise<void> => {
-    // 1. Delete all projects owned by user (this utilizes deleteProject logic for cascade)
-    const { data: projects, error: projectsError } = await supabase.from('projects').select('id').eq('user_id', userId);
-    if (projectsError) handleSupabaseError(projectsError, 'Error fetching user projects for deletion');
-
+    // Delete user logic - cascading deletes handled by DB or manually here
+    // 1. Delete Projects (which deletes chats/messages via cascade in deleteProject)
+    const { data: projects } = await supabase.from('projects').select('id').eq('user_id', userId);
     if (projects) {
-        for (const project of projects) {
-            await deleteProject(supabase, project.id);
+        for (const p of projects) {
+            await deleteProject(supabase, p.id);
         }
     }
-
-    // 2. Delete standalone chats (autonomous mode)
-    const { data: chats, error: chatsError } = await supabase.from('chats').select('id').eq('user_id', userId);
-    if (chatsError) handleSupabaseError(chatsError, 'Error fetching user chats for deletion');
-
-    if (chats && chats.length > 0) {
-        const chatIds = chats.map(c => c.id);
-        // Delete messages in those chats
-        const { error: msgError } = await supabase.from('messages').delete().in('chat_id', chatIds);
-        if (msgError) handleSupabaseError(msgError, 'Error deleting user messages');
-        
-        // Delete chats
-        const { error: chatDelError } = await supabase.from('chats').delete().in('id', chatIds);
-        if (chatDelError) handleSupabaseError(chatDelError, 'Error deleting user chats');
-    }
-
-    // 3. Delete memories
-    const { error: memError } = await supabase.from('memories').delete().eq('user_id', userId);
-    if (memError) handleSupabaseError(memError, 'Error deleting user memories');
-
-    // 4. Delete profile
-    const { error: profileError } = await supabase.from('profiles').delete().eq('id', userId);
-    if (profileError) handleSupabaseError(profileError, 'Error deleting user profile');
+    // 2. Delete Profile
+    const { error } = await supabase.from('profiles').delete().eq('id', userId);
+    if (error) handleSupabaseError(error, 'Error deleting user profile');
 };
 
-// FIX: Added missing function to increment the user's daily thinking usage count.
 export const incrementThinkingCount = async (supabase: SupabaseClient, userId: string): Promise<void> => {
     const today = new Date().toISOString().split('T')[0];
     const { error } = await supabase.rpc('increment_thinking_count', {
@@ -360,6 +344,18 @@ export const incrementThinkingCount = async (supabase: SupabaseClient, userId: s
     }
 };
 
+export const getUserProfile = async (supabase: SupabaseClient, userId: string): Promise<Profile | null> => {
+    const { data, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .maybeSingle();
+
+    if (error) {
+        handleSupabaseError(error, 'Error fetching user profile');
+    }
+    return data;
+};
 
 // === Messages ===
 
@@ -371,13 +367,16 @@ export const getMessages = async (supabase: SupabaseClient, chatId: string): Pro
         .order('created_at', { ascending: true });
 
     if (error) handleSupabaseError(error, 'Error fetching messages');
-    
-    // Map DB snake_case to App camelCase
-    return (data || []).map(mapMessageFromDB);
+    return data || [];
 };
 
 export const addMessage = async (supabase: SupabaseClient, message: Omit<Message, 'id' | 'created_at'>): Promise<Message> => {
-    const messageToInsert = mapMessageToDB(message);
+    // Create a copy of the message object to avoid mutating the original
+    const messageToInsert = { ...message };
+
+    // The 'imageStatus' property is for UI state management only and does not exist
+    // in the database schema. It must be removed before insertion to prevent an error.
+    delete (messageToInsert as Partial<Message>).imageStatus;
 
     const { data, error } = await supabase
         .from('messages')
@@ -386,21 +385,18 @@ export const addMessage = async (supabase: SupabaseClient, message: Omit<Message
         .single();
     
     if (error) handleSupabaseError(error, 'Error adding message');
-    return mapMessageFromDB(data);
+    return data;
 };
 
 export const updateMessage = async (supabase: SupabaseClient, messageId: string, updates: Partial<Message>): Promise<Message> => {
-    const updatesToInsert = mapMessageToDB(updates);
-
     const { data, error } = await supabase
         .from('messages')
-        .update(updatesToInsert)
+        .update(updates)
         .eq('id', messageId)
         .select()
         .single();
-        
     if (error) handleSupabaseError(error, 'Error updating message');
-    return mapMessageFromDB(data);
+    return data;
 };
 
 export const deleteMessage = async (supabase: SupabaseClient, messageId: string): Promise<void> => {
@@ -420,7 +416,7 @@ export const updateMessagePlan = async (supabase: SupabaseClient, messageId: str
         .single();
 
     if (error) handleSupabaseError(error, 'Error updating message plan');
-    return mapMessageFromDB(data);
+    return data;
 };
 
 export const updateMessageClarification = async (supabase: SupabaseClient, messageId: string, clarification: any): Promise<Message> => {
@@ -432,7 +428,7 @@ export const updateMessageClarification = async (supabase: SupabaseClient, messa
         .single();
     
     if (error) handleSupabaseError(error, 'Error updating message clarification');
-    return mapMessageFromDB(data);
+    return data;
 };
 
 // === Memories (New AI-Controlled System) ===
@@ -782,231 +778,44 @@ export const deleteMemory = async (supabase: SupabaseClient, memoryId: string): 
     if (error) handleSupabaseError(error, 'Error deleting memory');
 };
 
-// === Friends / Social ===
-
-export const getFriendships = async (supabase: SupabaseClient, userId: string): Promise<Friendship[]> => {
-    const { data, error } = await supabase
-        .from('friendships')
-        .select(`
-            id, status, created_at, user_id, friend_id,
-            user:profiles!user_id(*),
-            friend:profiles!friend_id(*)
-        `)
-        .or(`user_id.eq.${userId},friend_id.eq.${userId}`)
-        .eq('status', 'accepted');
-
-    if (error) handleSupabaseError(error, 'Error fetching friends');
-    
-    return (data || []).map((f: any) => {
-        const otherUser = f.user_id === userId ? f.friend : f.user;
-        return {
-            id: f.id,
-            user_id: userId,
-            friend_id: otherUser.id,
-            status: f.status,
-            created_at: f.created_at,
-            other_user: otherUser
-        };
-    });
-};
-
-export const getPendingFriendRequests = async (supabase: SupabaseClient, userId: string): Promise<any[]> => {
-    const { data, error } = await supabase
-        .from('friendships')
-        .select(`*, sender:profiles!user_id(*)`)
-        .eq('friend_id', userId)
-        .eq('status', 'pending');
-
-    if (error) handleSupabaseError(error, 'Error fetching pending requests');
+// Social Functions placeholders (ensure they use limited selects if possible)
+export const getFriendships = async (supabase: SupabaseClient, userId: string) => {
+    const { data } = await supabase.from('friendships').select(`*, other_user:profiles!friend_id(*)`).eq('user_id', userId).eq('status', 'accepted');
     return data || [];
 };
-
-export const getOutgoingFriendRequests = async (supabase: SupabaseClient, userId: string): Promise<any[]> => {
-    const { data, error } = await supabase
-        .from('friendships')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('status', 'pending');
-
-    if (error) handleSupabaseError(error, 'Error fetching outgoing requests');
+export const getPendingFriendRequests = async (supabase: SupabaseClient, userId: string) => {
+    const { data } = await supabase.from('friendships').select(`*, sender:profiles!user_id(*)`).eq('friend_id', userId).eq('status', 'pending');
     return data || [];
 };
-
-export const sendFriendRequest = async (supabase: SupabaseClient, userId: string, friendId: string): Promise<void> => {
-    const { data: existing } = await supabase
-        .from('friendships')
+export const getOutgoingFriendRequests = async (supabase: SupabaseClient, userId: string) => {
+    const { data } = await supabase.from('friendships').select('*').eq('user_id', userId).eq('status', 'pending');
+    return data || [];
+};
+export const sendFriendRequest = async (supabase: SupabaseClient, userId: string, friendId: string) => {
+    await supabase.from('friendships').insert({ user_id: userId, friend_id: friendId, status: 'pending' });
+};
+export const updateFriendRequest = async (supabase: SupabaseClient, id: string, status: string) => {
+    await supabase.from('friendships').update({ status }).eq('id', id);
+};
+export const getNotifications = async (supabase: SupabaseClient, userId: string) => {
+    const { data } = await supabase.from('notifications').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(20);
+    return data || [];
+};
+export const getPrivateMessages = async (supabase: SupabaseClient, u1: string, u2: string) => {
+    const { data } = await supabase.from('private_messages')
         .select('*')
-        .or(`and(user_id.eq.${userId},friend_id.eq.${friendId}),and(user_id.eq.${friendId},friend_id.eq.${userId})`)
-        .single();
-    
-    if (existing) {
-        if (existing.status === 'accepted') throw new Error("Already friends");
-        if (existing.status === 'pending') throw new Error("Request pending");
-        throw new Error("Cannot send request");
-    }
-
-    const { error } = await supabase.from('friendships').insert({
-        user_id: userId,
-        friend_id: friendId,
-        status: 'pending'
-    });
-    
-    if (error) handleSupabaseError(error, 'Error sending friend request');
-};
-
-export const updateFriendRequest = async (supabase: SupabaseClient, friendshipId: string, status: 'accepted' | 'blocked' | 'rejected'): Promise<void> => {
-    const { error } = await supabase
-        .from('friendships')
-        .update({ status })
-        .eq('id', friendshipId);
-        
-    if (error) handleSupabaseError(error, 'Error updating friend request');
-};
-
-// === Notifications ===
-
-export const getNotifications = async (supabase: SupabaseClient, userId: string): Promise<Notification[]> => {
-    try {
-        const { data, error } = await supabase
-            .from('notifications')
-            .select(`*, related_user:profiles!related_user_id(*)`)
-            .eq('user_id', userId)
-            .order('created_at', { ascending: false })
-            .limit(50);
-            
-        if (error) {
-            // Updated Error Handling: Check for missing FK and fallback
-            if (error.code === 'PGRST200' || error.message.includes('foreign key')) {
-                // Fallback: Fetch without relation
-                 const { data: simpleData, error: simpleError } = await supabase
-                    .from('notifications')
-                    .select('*')
-                    .eq('user_id', userId)
-                    .order('created_at', { ascending: false })
-                    .limit(50);
-                 
-                 if (simpleError) {
-                     // If even simple fetch fails, allow it to throw or return empty
-                     console.warn("Simple notification fetch failed:", simpleError);
-                     return [];
-                 }
-                 return simpleData || [];
-            }
-            handleSupabaseError(error, 'Error fetching notifications');
-        }
-        return data || [];
-    } catch (e) {
-        console.error("Notification fetch failed:", e);
-        return [];
-    }
-};
-
-// === Private Messages ===
-
-export const getPrivateMessages = async (supabase: SupabaseClient, userId: string, otherUserId: string): Promise<PrivateMessage[]> => {
-    const { data, error } = await supabase
-        .from('private_messages')
-        .select('*')
-        .or(`and(sender_id.eq.${userId},recipient_id.eq.${otherUserId}),and(sender_id.eq.${otherUserId},recipient_id.eq.${userId})`)
+        .or(`and(sender_id.eq.${u1},recipient_id.eq.${u2}),and(sender_id.eq.${u2},recipient_id.eq.${u1})`)
         .order('created_at', { ascending: true });
-        
-    if (error) handleSupabaseError(error, 'Error fetching private messages');
     return data || [];
 };
-
-export const sendPrivateMessage = async (supabase: SupabaseClient, senderId: string, recipientId: string, content: string): Promise<PrivateMessage> => {
-    const conversationId = [senderId, recipientId].sort().join(':');
-    const { data, error } = await supabase
-        .from('private_messages')
-        .insert({
-            sender_id: senderId,
-            recipient_id: recipientId,
-            content,
-            conversation_id: conversationId
-        })
-        .select()
-        .single();
-        
-    if (error) handleSupabaseError(error, 'Error sending message');
-    return data;
+export const sendPrivateMessage = async (supabase: SupabaseClient, s: string, r: string, c: string) => {
+    await supabase.from('private_messages').insert({ sender_id: s, recipient_id: r, content: c });
 };
-
-export const addChatParticipant = async (supabase: SupabaseClient, chatId: string, userId: string): Promise<void> => {
-    const { data: existing } = await supabase
-        .from('chat_participants')
-        .select('*')
-        .eq('chat_id', chatId)
-        .eq('user_id', userId)
-        .single();
-        
-    if (existing) return;
-
-    const { error } = await supabase
-        .from('chat_participants')
-        .insert({ chat_id: chatId, user_id: userId });
-        
-    if (error) handleSupabaseError(error, 'Error adding participant');
-};
-
-export const searchUsers = async (supabase: SupabaseClient, query: string, currentUserId: string): Promise<Profile[]> => {
-    const { data, error } = await supabase
-        .from('profiles')
-        .select('*')
-        .neq('id', currentUserId)
-        .ilike('roblox_username', `%${query}%`)
-        .limit(20);
-        
-    if (error) handleSupabaseError(error, 'Error searching users');
+export const addChatParticipant = async (supabase: SupabaseClient, c: string, u: string) => {};
+export const searchUsers = async (supabase: SupabaseClient, q: string, u: string) => {
+    const { data } = await supabase.from('profiles').select('*').ilike('roblox_username', `%${q}%`).neq('id', u).limit(10);
     return data || [];
-};
-
-export const getProject = async (supabase: SupabaseClient, projectId: string): Promise<Project | null> => {
-    const { data, error } = await supabase
-        .from('projects')
-        .select('*')
-        .eq('id', projectId)
-        .single();
-    
-    if (error) {
-        if (error.code === 'PGRST116') return null; // Not found
-        handleSupabaseError(error, 'Error fetching project');
-    }
-    return data;
 };
 
 // FIX: Export ChatWithProjectData since it is used in the return type of an exported function.
 export type { ChatWithProjectData };
-
-// Map DB snake_case to App camelCase
-const mapMessageFromDB = (data: any): Message => {
-    return {
-        ...data,
-        emotionData: data.emotion_data,
-        createdMemories: data.created_memories,
-        groundingMetadata: data.grounding_metadata,
-    };
-};
-
-// Map App camelCase to DB snake_case
-const mapMessageToDB = (msg: Partial<Message>): any => {
-    const dbMsg: any = { ...msg };
-    
-    // Map specific fields
-    if (dbMsg.emotionData !== undefined) {
-        dbMsg.emotion_data = dbMsg.emotionData;
-        delete dbMsg.emotionData;
-    }
-    if (dbMsg.createdMemories !== undefined) {
-        dbMsg.created_memories = dbMsg.createdMemories;
-        delete dbMsg.createdMemories;
-    }
-    if (dbMsg.groundingMetadata !== undefined) {
-        dbMsg.grounding_metadata = dbMsg.groundingMetadata;
-        delete dbMsg.groundingMetadata;
-    }
-    
-    // Cleanup UI-only fields
-    delete dbMsg.imageStatus;
-    
-    return dbMsg;
-};

@@ -134,10 +134,6 @@ export const ChatView: React.FC<ChatViewProps> = ({
   // I will add resyncMessage to the props of ChatView in the Layout file change.
   // But for now, let's just leave the prop definition and usage here.
   
-  // Since we can't change Layout easily without the full file content which is huge, 
-  // I will assume the parent (Layout) is passing it. 
-  // Wait, I am modifying Layout.tsx in this response! I will add it there.
-  
   // Actually, I can't easily import useChat here to get the *same* instance. 
   // I'll add `onResync` to the interface.
   
@@ -268,7 +264,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
         {workspaceMode === 'autonomous' && (
             <>
                 <div className="absolute inset-0 z-0"><AuroraCanvas /></div>
-                <div className="absolute inset-0 z-0 bg-bg-primary transition-opacity duration-[800ms] ease-in-out pointer-events-none" style={{ opacity: messages.length > 0 ? 0.7 : 0 }} />
+                <div className="absolute inset-0 z-0 bg-bg-primary transition-opacity duration-[800ms] ease-in-out pointer-events-none" style={{ opacity: messages.length > 0 ? 0.85 : 0 }} />
             </>
         )}
 
